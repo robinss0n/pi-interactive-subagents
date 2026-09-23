@@ -822,6 +822,54 @@ function buildSubagentToolAllowlist(
 }
 
 /**
+ * Resolve extension entry points for the npm pi packages explicitly allowlisted
+ * in settings.json under `subagents.forwardPackages`, e.g.
+ *
+ *   "subagents": { "forwardPackages": ["npm:@gotgenes/pi-anthropic-auth"] }
+ *
+ * Children run with `--no-extensions`, so a provider-override package such as
+ * an Anthropic OAuth shim must be forwarded explicitly, otherwise the child
+ * falls back to the raw API key instead of the parent's subscription auth.
+ * Only allowlisted packages are forwarded, preserving default-deny for the rest.
+ */
+function resolveProviderExtensions(): string[] {
+  const paths: string[] = [];
+  try {
+    const settingsPath = join(getAgentConfigDir(), "settings.json");
+    if (!existsSync(settingsPath)) return paths;
+    const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+    const forward = settings?.subagents?.forwardPackages;
+    const packages: string[] = Array.isArray(forward)
+      ? forward.filter((p: unknown): p is string => typeof p === "string")
+      : [];
+    const npmBase = join(getAgentConfigDir(), "npm", "node_modules");
+    for (const pkg of packages) {
+      // Resolve npm packages ("npm:@scope/name" or "npm:@scope/name@version")
+      const npmMatch = pkg.match(/^npm:(.+?)(?:@[^@/]+)?$/);
+      if (!npmMatch) continue;
+      const pkgName = npmMatch[1];
+      const pkgJsonPath = join(npmBase, pkgName, "package.json");
+      if (!existsSync(pkgJsonPath)) continue;
+      try {
+        const pkgJson = JSON.parse(readFileSync(pkgJsonPath, "utf8"));
+        const extensions: string[] = pkgJson?.pi?.extensions;
+        if (!Array.isArray(extensions)) continue;
+        for (const ext of extensions) {
+          const extPath = join(npmBase, pkgName, ext);
+          if (existsSync(extPath)) paths.push(extPath);
+        }
+      } catch {
+        // skip malformed package.json
+      }
+    }
+  } catch {
+    // Best-effort: if settings can't be read, return empty — the child will
+    // fall back to its default provider, which is the existing behavior.
+  }
+  return paths;
+}
+
+/**
  * Apply a loadout snapshot's sandbox to a pi command's `parts` array: model,
  * identity (system prompt), and the default-deny tool/extension restriction
  * (`--no-extensions` + `--tools` + one `-e` per tool-backing extension).
@@ -869,6 +917,14 @@ function applySandboxToParts(
       const extPath = getToolExtensionPath(tool);
       if (extPath && existsSync(extPath)) extPaths.add(extPath);
     }
+
+    // Forward allowlisted provider-override packages (subagents.forwardPackages
+    // in settings.json). Without these the child falls back to the raw API key,
+    // which may be out of credits when the parent relies on OAuth.
+    for (const extPath of resolveProviderExtensions()) {
+      extPaths.add(extPath);
+    }
+
     for (const extPath of extPaths) {
       parts.push("-e", shellEscape(extPath));
     }
