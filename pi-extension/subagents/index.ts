@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { keyHint } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   readdirSync,
@@ -12,6 +12,7 @@ import {
   mkdirSync,
   copyFileSync,
   unlinkSync,
+  statSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import {
@@ -822,10 +823,16 @@ function buildSubagentToolAllowlist(
 }
 
 /**
- * Resolve extension entry points for the npm pi packages explicitly allowlisted
- * in settings.json under `subagents.forwardPackages`, e.g.
+ * Resolve extension entry points for the pi packages explicitly allowlisted in
+ * settings.json under `subagents.forwardPackages`, e.g.
  *
- *   "subagents": { "forwardPackages": ["npm:@gotgenes/pi-anthropic-auth"] }
+ *   "subagents": { "forwardPackages": [
+ *     "npm:@gotgenes/pi-anthropic-auth",
+ *     "extensions/provider-fallback"
+ *   ] }
+ *
+ * Entries are npm packages (`npm:name[@version]`) or local paths (absolute, or
+ * relative to the agent config dir) to an extension file or a package directory.
  *
  * Children run with `--no-extensions`, so a provider-override package such as
  * an Anthropic OAuth shim must be forwarded explicitly, otherwise the child
@@ -834,6 +841,21 @@ function buildSubagentToolAllowlist(
  */
 function resolveProviderExtensions(): string[] {
   const paths: string[] = [];
+  const addPackageDir = (dir: string) => {
+    const pkgJsonPath = join(dir, "package.json");
+    if (!existsSync(pkgJsonPath)) return;
+    try {
+      const pkgJson = JSON.parse(readFileSync(pkgJsonPath, "utf8"));
+      const extensions: string[] = pkgJson?.pi?.extensions;
+      if (!Array.isArray(extensions)) return;
+      for (const ext of extensions) {
+        const extPath = join(dir, ext);
+        if (existsSync(extPath)) paths.push(extPath);
+      }
+    } catch {
+      // skip malformed package.json
+    }
+  };
   try {
     const settingsPath = join(getAgentConfigDir(), "settings.json");
     if (!existsSync(settingsPath)) return paths;
@@ -846,21 +868,15 @@ function resolveProviderExtensions(): string[] {
     for (const pkg of packages) {
       // Resolve npm packages ("npm:@scope/name" or "npm:@scope/name@version")
       const npmMatch = pkg.match(/^npm:(.+?)(?:@[^@/]+)?$/);
-      if (!npmMatch) continue;
-      const pkgName = npmMatch[1];
-      const pkgJsonPath = join(npmBase, pkgName, "package.json");
-      if (!existsSync(pkgJsonPath)) continue;
-      try {
-        const pkgJson = JSON.parse(readFileSync(pkgJsonPath, "utf8"));
-        const extensions: string[] = pkgJson?.pi?.extensions;
-        if (!Array.isArray(extensions)) continue;
-        for (const ext of extensions) {
-          const extPath = join(npmBase, pkgName, ext);
-          if (existsSync(extPath)) paths.push(extPath);
-        }
-      } catch {
-        // skip malformed package.json
+      if (npmMatch) {
+        addPackageDir(join(npmBase, npmMatch[1]));
+        continue;
       }
+      // Local path: a single extension file, or a package directory.
+      const localPath = isAbsolute(pkg) ? pkg : join(getAgentConfigDir(), pkg);
+      if (!existsSync(localPath)) continue;
+      if (statSync(localPath).isDirectory()) addPackageDir(localPath);
+      else paths.push(localPath);
     }
   } catch {
     // Best-effort: if settings can't be read, return empty — the child will
